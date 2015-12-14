@@ -28,7 +28,7 @@
 * source and binary forms, with or without modification, are subject to the Software License 
 * Agreement in the file "anaren_eula.txt"
 * 
-* YOU FURTHER ACKNOWLEDGE AND AGREE THAT THE SOFTWARE AND DOCUMENTATION ARE PROVIDED ìAS ISî 
+* YOU FURTHER ACKNOWLEDGE AND AGREE THAT THE SOFTWARE AND DOCUMENTATION ARE PROVIDED ‚ÄúAS IS‚Äù 
 * WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION, ANY 
 * WARRANTY OF MERCHANTABILITY, TITLE, NON-INFRINGEMENT AND FITNESS FOR A PARTICULAR PURPOSE. IN NO 
 * EVENT SHALL ANAREN MICROWAVE OR TESLA CONTROLS BE LIABLE OR OBLIGATED UNDER CONTRACT, NEGLIGENCE, 
@@ -83,14 +83,11 @@ enum TRACK_STATE
 * Gets changed by other states, or based on messages that arrive. */
 enum STATE state = STATE_MODULE_STARTUP;
 
-/** State of the tracking algorithm state machine */
-enum TRACK_STATE track_state = ALL_ITEMS_CONNECTED;
-
 /** The main application state machine */
 static void stateMachine();
 
 /* Tracking state machine */
-static void trackingStateMachine();
+static void trackingStateMachine(int router_index);
 
 /** Various utility functions */
 static char* getRgbLedDisplayModeName(uint8_t mode);
@@ -101,15 +98,34 @@ static uint8_t setModuleLeds(uint8_t mode);
 /** Various flags between states */
 volatile uint16_t stateFlags = 0;
 
-#define LQI_THRESHOLD                   0x70
+#define LQI_THRESHOLD                   0x50
 #define LQI_NUM_SAMPLES                 6
-uint8_t LQI = 0;
-uint8_t LQI_running_average[LQI_NUM_SAMPLES];
-uint8_t LQI_iter = 0;
-uint8_t item_loss_iter = 0;
-uint16_t LQI_total = 0;
-uint8_t LQI_average = 0;
-uint8_t LQI_initialized = 0;
+#define NUM_DEVICES                     10
+int DEVICES_REGISTERED = 0;
+
+int current_router_index = 0;
+int coordinator_on = 1;
+
+#define BUZZER                          BIT0
+
+struct router_device {
+  /** State of the tracking algorithm state machine */
+  enum TRACK_STATE track_state;
+  uint8_t MAC_address[8];
+  uint8_t LQI_running_average[LQI_NUM_SAMPLES];
+  uint8_t LQI;
+  uint8_t LQI_iter;
+  uint16_t LQI_total;
+  uint8_t LQI_average;
+  uint8_t LQI_initialized;
+};
+
+struct router_device routers[NUM_DEVICES];
+uint8_t alarm_sounding = 0;
+uint8_t alarm_silenced = 0;
+uint8_t program_mode = 0;
+
+void structInit();
 
 #define NWK_OFFLINE                     0
 #define NWK_ONLINE                      1
@@ -126,16 +142,37 @@ uint8_t rgbLedDisplayMode = 0;
 
 extern uint8_t zmBuf[ZIGBEE_MODULE_BUFFER_SIZE];
 
+void addMacAddress(int index, uint8_t* mac_address);
+
 //uncomment below to see more information about the messages received.
 //#define VERBOSE_MESSAGE_DISPLAY
 
 int main( void )
 {
+    structInit();
     halInit();
     moduleInit();
     buttonIsr = &handleButtonPress;    
     printf("\r\n****************************************************\r\n");
     printf("Simple Application Example - COORDINATOR\r\n");
+    
+    routers[0].MAC_address[0] = 0x5E;
+    routers[0].MAC_address[1] = 0xD2;
+    routers[0].MAC_address[2] = 0x5D;
+    routers[0].MAC_address[3] = 0x02;
+    routers[0].MAC_address[4] = 0x00;
+    routers[0].MAC_address[5] = 0x4B;
+    routers[0].MAC_address[6] = 0x12;
+    routers[0].MAC_address[7] = 0x00;
+    
+    routers[1].MAC_address[0] = 0xD3;
+    routers[1].MAC_address[1] = 0xD3;
+    routers[1].MAC_address[2] = 0x5D;
+    routers[1].MAC_address[3] = 0x02;
+    routers[1].MAC_address[4] = 0x00;
+    routers[1].MAC_address[5] = 0x4B;
+    routers[1].MAC_address[6] = 0x12;
+    routers[1].MAC_address[7] = 0x00;
     
     HAL_ENABLE_INTERRUPTS();
     clearLeds();
@@ -143,10 +180,49 @@ int main( void )
     halRgbLedPwmInit();
     
     while (1) {
-      stateMachine();    //run the state machine
-      //trackingStateMachine();
+        stateMachine();    //run the state machine
+        if (alarm_sounding == 1 && !alarm_silenced) {
+          delayMs(2);
+          toggleLed(0);
+        }
     }
 }
+
+void structInit() {
+  
+  int i;
+  for (i = 0; i < NUM_DEVICES; i++) {
+    routers[i].LQI = 0;
+    routers[i].LQI_average = 0;
+    routers[i].LQI_initialized = 0;
+    routers[i].LQI_iter = 0;
+    routers[i].LQI_total = 0;
+
+    int j = 0;
+    for (j = 0; j < 8; j++) {
+      routers[i].MAC_address[i] = 0;
+    }
+
+    int k = 0;
+    for (k = 0; k < LQI_NUM_SAMPLES; k++) {
+      routers[i].LQI_running_average[k] = 0;
+    }
+      
+    routers[i].track_state = ALL_ITEMS_CONNECTED;
+  }
+}
+
+/*
+void addMacAddress(int index, uint8_t* mac_address) {
+    routers[index].MAC_address[0] = mac_address[0];
+    routers[index].MAC_address[1] = mac_address[1];
+    routers[index].MAC_address[2] = mac_address[2];
+    routers[index].MAC_address[3] = mac_address[3];
+    routers[index].MAC_address[4] = mac_address[4];
+    routers[index].MAC_address[5] = mac_address[5];
+    routers[index].MAC_address[6] = mac_address[6];
+    routers[index].MAC_address[7] = mac_address[7];
+}*/
 
 /** 
 Called from state machine when a button was pressed. 
@@ -154,27 +230,22 @@ Selects which KVP value is displayed on the RGB LED.
 */
 void processButtonPress()
 {
-  /*
-    rgbLedDisplayMode++;
-    if (rgbLedDisplayMode > RGB_LED_DISPLAY_MODE_MAX)
-    {
-        rgbLedDisplayMode = 0;
-        halRgbSetLeds(RGB_LED_PWM_OFF, RGB_LED_PWM_OFF, RGB_LED_PWM_OFF);    
-    }
-    printf("Setting State to %s (%u)\r\n", getRgbLedDisplayModeName(rgbLedDisplayMode), rgbLedDisplayMode);
-    
-    uint8_t result = setModuleLeds(rgbLedDisplayMode);
-    if (result != 0)
-    {
-        printf("Error %u setting Module LEDs\r\n", result);
-    }
-    
-    resetNominalTemperature();
-    resetNominalColor();
-    */
-    if (track_state == ITEM_LOST_ALARM) {
-      track_state = ITEM_LOST_SILENCED;
-    }
+  if (alarm_sounding == 1) {
+      halRgbSetLeds(0, 0xFF, 0);
+      alarm_silenced = 1;
+  }
+}
+
+void processButtonHold()
+{
+  if (coordinator_on == 0) {
+    coordinator_on = 1;
+    halRgbSetLeds(0, 0, 0);
+  }
+  else {
+    coordinator_on = 0;
+    halRgbSetLeds(0xFF, 0xFF, 0xFF);
+  }
 }
 
 /** 
@@ -207,6 +278,27 @@ static uint8_t debounceButton(uint8_t button)
     return (buttonOnCount > buttonOffCount);
 }
 
+static uint8_t debounceButtonHold(uint8_t button)
+{
+#define BUTTON_DEBOUNCE_HOLD_TIME_MS  5000    // How long to poll the button, total
+#define BUTTON_POLL_INTERVAL_MS 5       // How long to wait between polling button
+    int16_t time = 0;                   // The amount of time that has elapsed in the debounce routine
+    int16_t buttonOnCount = 0;          // Number of times button was polled and ON
+    int16_t buttonOffCount = 0;         // Number of times button was polled and OFF 
+    
+    while (time < BUTTON_DEBOUNCE_HOLD_TIME_MS)
+    {
+        if (buttonIsPressed(button))
+            buttonOnCount++;
+        else
+            buttonOffCount++;
+        time += BUTTON_POLL_INTERVAL_MS;
+        delayMs(BUTTON_POLL_INTERVAL_MS);
+    }
+    
+    return (buttonOnCount > buttonOffCount);
+}
+
 /** 
 The main state machine for the application.
 Never exits.
@@ -225,10 +317,10 @@ void stateMachine()
         {
         case STATE_IDLE:
             {
-                if (stateFlags & STATE_FLAG_MESSAGE_WAITING)    // If there is a message waiting...
+                if (stateFlags & STATE_FLAG_MESSAGE_WAITING & coordinator_on)    // If there is a message waiting...
                 {
                     parseMessages();                            // ... then display it
-                    trackingStateMachine();
+                    trackingStateMachine(current_router_index);
                     stateFlags &= ~STATE_FLAG_MESSAGE_WAITING;
                 }
                 
@@ -237,6 +329,10 @@ void stateMachine()
                     if (debounceButton(ANY_BUTTON))             // ...then debounce it
                     {
                         processButtonPress();                   // ...and process it
+                    }
+                    if (debounceButtonHold(ANY_BUTTON))
+                    {
+                        processButtonHold();
                     }
                     stateFlags &= ~STATE_FLAG_BUTTON_PRESSED;
                 }
@@ -265,7 +361,7 @@ void stateMachine()
                     printf("FAILED. Error Code 0x%02X. Retrying...\r\n", result);
                     delayMs(MODULE_START_DELAY_IF_FAIL_MS);
                 }
-                printf("Success\r\n");
+                //printf("Success\r\n");
                 zigbeeNetworkStatus = NWK_ONLINE;
                 
                 state = STATE_DISPLAY_NETWORK_INFORMATION;
@@ -281,11 +377,12 @@ void stateMachine()
                 {
                     printf("ERROR\r\n");
                 }
+                /*
                 printf("Press button to change which received value is displayed on RGB LED. D6 & D5 will indicate mode:\r\n");
                 printf("    None = None\r\n");
                 printf("    Yellow (D9) = IR Temp Sensor\r\n");
                 printf("    Red (D8) = Color Sensor\r\n");
-                
+                */
                 printf("Displaying Messages Received\r\n");
                 setModuleLeds(RGB_LED_DISPLAY_MODE_NONE);
                 
@@ -307,30 +404,59 @@ void stateMachine()
  //   } 
 }    
 
-void trackingStateMachine() {
-  if (LQI != 0) {
+void trackingStateMachine(int router_index) {
+  if (routers[router_index].LQI != 0) {
     
-    if (LQI_iter == LQI_NUM_SAMPLES) {
-      LQI_iter = 0;
-      LQI_initialized = 1;
+    if (routers[router_index].LQI_iter == LQI_NUM_SAMPLES) {
+      routers[router_index].LQI_iter = 0;
+      routers[router_index].LQI_initialized = 1;
     }
-
-    uint8_t oldest_LQI = LQI_running_average[LQI_iter];
-    LQI_running_average[LQI_iter] = LQI;
     
-    if (LQI_initialized == 1)
-      LQI_total -= oldest_LQI;
-    LQI_total += LQI;
+    uint8_t oldest_LQI = routers[router_index].LQI_running_average[(routers[router_index].LQI_iter)];
+    routers[router_index].LQI_running_average[routers[router_index].LQI_iter] = routers[router_index].LQI;
+    
+    if (routers[router_index].LQI_initialized == 1)
+      routers[router_index].LQI_total -= oldest_LQI;
+    routers[router_index].LQI_total += routers[router_index].LQI;
 
-    LQI_average = LQI_total / LQI_NUM_SAMPLES;
-    LQI_iter++;
+    routers[router_index].LQI_average = routers[router_index].LQI_total / LQI_NUM_SAMPLES;
+    routers[router_index].LQI_iter++;
+    
+    int i, j, k;
+    for (i = 0; i < NUM_DEVICES; i++) {
+      printf("Most recent LQI value: %02X\r\n", routers[i].LQI);      
+      
+      printf("LQI ARRAY for device at MAC address: ");
+      for (k = 7; k >= 0; k--) {
+        printf("%02X", routers[i].MAC_address[k]);
+      }
+      printf("\r\n");
+      for (j = 0; j < LQI_NUM_SAMPLES; j++) {
+        printf("%d:", j);
+        printf("%02X ", routers[i].LQI_running_average[j]);
+      }
+      printf("\r\n");
+      printf("AVERAGE: %02X\r\n", routers[i].LQI_average);
+    }
    
-    switch(track_state) {
+    switch(routers[router_index].track_state) {
       
     case ALL_ITEMS_CONNECTED:
-      halRgbSetLeds(0, 0, 0xFF);
-      if (LQI_average < LQI_THRESHOLD && LQI_initialized == 1) {
-          track_state = ITEM_LOST_ALARM;
+      alarm_silenced = 0;
+      if (alarm_sounding == 0) {
+        int items_connected = 0;
+        int j;
+        for (j = 0; j < NUM_DEVICES; j++) {
+          if (routers[router_index].track_state == ALL_ITEMS_CONNECTED)
+            items_connected++;
+        }
+        if (items_connected == NUM_DEVICES)
+          printf("ALL DEVICES CONNECTED\r\n");
+
+        halRgbSetLeds(0, 0, 0xFF);
+      }
+      if (routers[router_index].LQI_average < LQI_THRESHOLD && routers[router_index].LQI_initialized == 1) {
+          routers[router_index].track_state = ITEM_LOST_ALARM;
       }
       break;
     /*
@@ -345,19 +471,35 @@ void trackingStateMachine() {
       break;
     */
     case ITEM_LOST_ALARM:
-      halRgbSetLeds(0xFF, 0, 0);
+      printf("LOST ITEM AT ROUTER INDEX: %d\r\n", router_index);
+      if (alarm_sounding == 0) {
+        halRgbSetLeds(0xFF, 0, 0);
+        alarm_sounding = 1;
+      }
+      if (routers[router_index].LQI_average > LQI_THRESHOLD) {
+        routers[router_index].track_state = ALL_ITEMS_CONNECTED;
+      }
+      int i;
+      int devices_connected = 0;
+      for (i = 0; i < NUM_DEVICES; i++) {
+        if (routers[router_index].track_state == ALL_ITEMS_CONNECTED)
+          devices_connected++;
+      }
+      if (devices_connected == NUM_DEVICES)
+        alarm_sounding = 0;
       break;
     
+      /*
     case ITEM_LOST_SILENCED:
       halRgbSetLeds(0, 0xFF, 0);
-      if (LQI_average > LQI_THRESHOLD) {
-        track_state = ALL_ITEMS_CONNECTED;
+      if (routers[router_index].LQI_average > LQI_THRESHOLD) {
+        routers[router_index].track_state = ALL_ITEMS_CONNECTED;
       }
       break;  
+      */
     }
   }
 }
-
 
 
 /** Parse any received messages. If it's one of our OIDs then display the value on the RGB LED too. */
@@ -366,7 +508,7 @@ void parseMessages()
     getMessage();
     if ((zmBuf[SRSP_LENGTH_FIELD] > 0) && (IS_AF_INCOMING_MESSAGE()))
     {
-        setLed(0);                                  //LED will blink to indicate a message was received
+        setLed(4);                                  //LED will blink to indicate a message was received
 #ifdef VERBOSE_MESSAGE_DISPLAY
         printAfIncomingMsgHeader(zmBuf);
         printf("\r\n");
@@ -385,8 +527,22 @@ void parseMessages()
             {
                 printf("%02X", im.header.mac[j]);
             }
+            int k;
+            for (k = 0; k < NUM_DEVICES; k++) {
+              int match = 1;
+              for (j = 7; j>(-1); j--) {
+                if (routers[k].MAC_address[j] != im.header.mac[j]) {
+                  match = 0;
+                }
+              }
+              if (match == 1) {
+                current_router_index = k;
+                routers[current_router_index].LQI = zmBuf[AF_INCOMING_MESSAGE_LQI_FIELD];
+              }
+            }
+            
             printf(", LQI=%02X, ", zmBuf[AF_INCOMING_MESSAGE_LQI_FIELD]);   // Display the received signal quality (Link Quality Indicator)
-            LQI = zmBuf[AF_INCOMING_MESSAGE_LQI_FIELD];
+            //LQI = zmBuf[AF_INCOMING_MESSAGE_LQI_FIELD];
 
 #endif
             printf("%u KVPs received:\r\n", im.numParameters);
@@ -499,4 +655,3 @@ static void handleButtonPress(int8_t button)
 }
 
 /* @} */
-
